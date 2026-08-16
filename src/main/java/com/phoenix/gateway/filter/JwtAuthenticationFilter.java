@@ -5,88 +5,167 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.*;
 import org.springframework.core.Ordered;
 import org.springframework.http.*;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
+import org.springframework.web.server.WebFilter;
+import org.springframework.web.server.WebFilterChain;
+
 import reactor.core.publisher.Mono;
 
 import java.util.List;
 
 @Component
-public class JwtAuthenticationFilter implements GlobalFilter, Ordered {
+public class JwtAuthenticationFilter implements GlobalFilter {
 
-    @Autowired
-    private JwtUtil jwtUtil;
+    private final JwtUtil jwtUtil;
 
-    // For below APIs no token required
+    // APIs that don't require JWT
     private static final List<String> PUBLIC_ROUTES = List.of(
             "/auth/login",
-            "/auth/register");
+            "/auth/register"
+    );
+
+    public JwtAuthenticationFilter(JwtUtil jwtUtil) {
+        this.jwtUtil = jwtUtil;
+    }
 
     @Override
-    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+    public Mono<Void> filter(
+            ServerWebExchange exchange,
+            GatewayFilterChain chain) {
 
-        String path = exchange.getRequest().getURI().getPath();
+        String path = exchange.getRequest()
+                .getURI()
+                .getPath();
+        System.out.println("========== JWT FILTER ==========");
+    System.out.println("Path: " + path);
 
-        // Skip public routes
+
+        // ==========================================
+        // 1. PUBLIC ROUTES
+        // ==========================================
+
         if (PUBLIC_ROUTES.stream().anyMatch(path::equals)) {
             return chain.filter(exchange);
         }
 
-        // Get Authorization header
+        // ==========================================
+        // 2. GET AUTHORIZATION HEADER
+        // ==========================================
+
         String authHeader = exchange.getRequest()
                 .getHeaders()
                 .getFirst(HttpHeaders.AUTHORIZATION);
 
+        // No Authorization header
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
             return unauthorized(exchange);
         }
 
+        // ==========================================
+        // 3. EXTRACT JWT
+        // ==========================================
+
         String token = authHeader.substring(7);
 
         try {
-            // Validate token
-            jwtUtil.validateToken(token);
 
-            // Extract data
+            // ==========================================
+            // 4. VALIDATE JWT
+            // ==========================================
+
+            if (!jwtUtil.isTokenValid(token)) {
+                return unauthorized(exchange);
+            }
+
+            // ==========================================
+            // 5. EXTRACT USER INFORMATION
+            // ==========================================
+
             String username = jwtUtil.extractUsername(token);
             String role = jwtUtil.extractRole(token);
 
-            // ROLE-BASED ACCESS CONTROL
+            // ==========================================
+            // 6. ROLE-BASED AUTHORIZATION
+            // ==========================================
 
-            // ADMIN only endpoints
-            if (path.startsWith("/admin") && !"ADMIN".equals(role)) {
+            // ADMIN-only endpoints
+            if (path.startsWith("/admin")
+                    && !"ADMIN".equals(role)) {
+
                 return forbidden(exchange);
             }
 
-            // USER endpoints (optional restriction)
-            if (path.startsWith("/user") && !(role.equals("USER") || role.equals("ADMIN"))) {
+            // USER endpoints
+            if (path.startsWith("/user")
+                    && !("USER".equals(role)
+                            || "ADMIN".equals(role))) {
+
                 return forbidden(exchange);
             }
-            // Forward user info to services
-            var mutatedRequest = exchange.getRequest().mutate()
-                    .header("X-Auth-User", username)
-                    .header("X-Auth-Role", role)
+
+            // ==========================================
+            // 7. FORWARD USER INFORMATION
+            // ==========================================
+
+            List<SimpleGrantedAuthority> authorities = List.of(new SimpleGrantedAuthority("ROLE_" + role));
+
+            UsernamePasswordAuthenticationToken authentication = new UsernamePasswordAuthenticationToken(
+                    username,
+                    null,
+                    authorities);
+
+            ServerWebExchange mutatedExchange = exchange.mutate()
+                    .request(request -> request
+                            .headers(headers -> {
+                                headers.remove("X-Auth-User");
+                                headers.remove("X-Auth-Role");
+
+                                headers.add("X-Auth-User", username);
+                                headers.add("X-Auth-Role", role);
+                            }))
                     .build();
 
-            return chain.filter(exchange.mutate().request(mutatedRequest).build());
+            return chain.filter(mutatedExchange)
+                    .contextWrite(
+                            ReactiveSecurityContextHolder.withAuthentication(
+                                    authentication));
 
         } catch (Exception e) {
+
+            // Invalid / expired / malformed JWT
             return unauthorized(exchange);
         }
     }
 
-    private Mono<Void> forbidden(ServerWebExchange exchange) {
-        exchange.getResponse().setStatusCode(HttpStatus.FORBIDDEN);
-        return exchange.getResponse().setComplete();
+    // ==========================================
+    // 401 UNAUTHORIZED
+    // ==========================================
+
+    private Mono<Void> unauthorized(
+            ServerWebExchange exchange) {
+
+        exchange.getResponse()
+                .setStatusCode(HttpStatus.UNAUTHORIZED);
+
+        return exchange.getResponse()
+                .setComplete();
     }
 
-    private Mono<Void> unauthorized(ServerWebExchange exchange) {
-        exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
-        return exchange.getResponse().setComplete();
-    }
+    // ==========================================
+    // 403 FORBIDDEN
+    // ==========================================
 
-    @Override
-    public int getOrder() {
-        return -1;
+    private Mono<Void> forbidden(
+            ServerWebExchange exchange) {
+
+        exchange.getResponse()
+                .setStatusCode(HttpStatus.FORBIDDEN);
+
+        return exchange.getResponse()
+                .setComplete();
     }
 }
